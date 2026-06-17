@@ -64,7 +64,6 @@ License: LGPL-3
     'depends': [
         'delivery',
         'website_sale',
-        'website_sale_delivery',
         'sale_management',
     ],
     'data': [

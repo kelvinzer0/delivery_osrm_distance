@@ -18,8 +18,9 @@ dispatch location and the customer's address.
 
 ## Requirements
 
-* Odoo 17
-* Installed: `delivery`, `website_sale`, `website_sale_delivery`
+* Odoo 17 Community (the official `odoo:17` Docker image works)
+* Installed: `delivery`, `website_sale` (the storefront delivery
+  integration was merged into `website_sale` in Odoo 17)
 
 ## Installation
 
