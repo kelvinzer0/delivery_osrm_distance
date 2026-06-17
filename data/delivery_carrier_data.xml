@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <!--
+        Pre-create a ready-to-use carrier configured with the Warung
+        Lakku branch coordinates supplied by the customer:
+            -8.188078, 112.356937  (lat, lng)
+
+        `noupdate="1"` so admin edits made via the UI are preserved
+        across module upgrades.
+    -->
+    <record id="carrier_warunglakku_distance" model="delivery.carrier">
+        <field name="name">Warung Lakku Delivery (Distance-based)</field>
+        <field name="product_id" ref="delivery.product_product_delivery"/>
+        <field name="delivery_type">osrm_distance</field>
+        <field name="integration_level">rate</field>
+        <field name="osrm_server_url">https://router.project-osrm.org</field>
+        <field name="osrm_nominatim_url">https://nominatim.openstreetmap.org</field>
+        <field name="osrm_origin_lat">-8.188078</field>
+        <field name="osrm_origin_lng">112.356937</field>
+        <field name="osrm_price_per_km">2000.0</field>
+        <field name="osrm_minimum_price">5000.0</field>
+        <field name="osrm_maximum_price">0.0</field>
+        <field name="active" eval="True"/>
+    </record>
+</odoo>

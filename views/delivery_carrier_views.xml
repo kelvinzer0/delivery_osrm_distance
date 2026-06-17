@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!--
+        Extend the standard delivery.carrier form to show the OSRM
+        configuration group when delivery_type == 'osrm_distance'.
+    -->
+    <record id="view_delivery_carrier_form_osrm" model="ir.ui.view">
+        <field name="name">delivery.carrier.form.osrm</field>
+        <field name="model">delivery.carrier</field>
+        <field name="inherit_id" ref="delivery.view_delivery_carrier_form"/>
+        <field name="arch" type="xml">
+            <!-- Inject into the existing "Settings" notebook page. -->
+            <xpath expr="//page[@name='settings']" position="inside">
+                <group string="OSRM Distance Configuration"
+                       invisible="delivery_type != 'osrm_distance'">
+                    <group string="Routing Server">
+                        <field name="osrm_server_url"/>
+                        <field name="osrm_nominatim_url"/>
+                    </group>
+                    <group string="Dispatch Coordinates">
+                        <field name="osrm_origin_lat"/>
+                        <field name="osrm_origin_lng"/>
+                    </group>
+                    <group string="Pricing">
+                        <field name="osrm_price_per_km"/>
+                        <field name="osrm_minimum_price"/>
+                        <field name="osrm_maximum_price"/>
+                    </group>
+                    <group string="Last Call (diagnostic)">
+                        <field name="osrm_last_distance_km" readonly="1"/>
+                        <field name="osrm_last_price" readonly="1"/>
+                        <field name="company_currency_id" invisible="1"/>
+                    </group>
+                </group>
+            </xpath>
+        </field>
+    </record>
+
+    <!-- Server action: manually geocode selected partners via Nominatim. -->
+    <record id="action_partner_geocode_nominatim" model="ir.actions.server">
+        <field name="name">Geocode Address (OSRM/Nominatim)</field>
+        <field name="model_id" ref="base.model_res_partner"/>
+        <field name="binding_model_id" ref="base.model_res_partner"/>
+        <field name="binding_view_types">list,form</field>
+        <field name="state">code</field>
+        <field name="code">
+            records.action_geocode_with_nominatim()
+        </field>
+    </record>
+</odoo>
