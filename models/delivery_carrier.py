@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import json
 import logging
+import math
+import re
 import urllib.parse
 import urllib.request
 
@@ -45,16 +47,27 @@ class DeliveryCarrier(models.Model):
         help="Longitude of the dispatch location (warehouse / store branch).",
     )
     osrm_price_per_km = fields.Monetary(
-        string='Price per km',
+        string='Price per km step',
         currency_field='company_currency_id',
-        default=2000.0,
-        help="Shipping price per kilometre of driving distance returned by OSRM.",
+        default=1000.0,
+        help="Shipping price per kilometre. When 'Round up to km step' is "
+             "enabled, the distance is rounded UP to the next integer km "
+             "before multiplying by this value (e.g. 2.01km * 1000 = 3000). "
+             "When disabled, the raw distance is used (linear pricing).",
+    )
+    osrm_round_up_km = fields.Boolean(
+        string='Round up to km step',
+        default=True,
+        help="When enabled, distance is rounded UP to the next integer km "
+             "before applying the per-km price. So 0.2km→1km, 1.8km→2km, "
+             "2.01km→3km. Combined with min_price=2000 and price_per_km=1000 "
+             "this gives: 0–2km = 2000, 2.01–3km = 3000, 3.01–4km = 4000, etc.",
     )
     osrm_minimum_price = fields.Monetary(
         string='Minimum Price',
         currency_field='company_currency_id',
-        default=5000.0,
-        help="Floor price. Applied even if (distance * price_per_km) is lower.",
+        default=2000.0,
+        help="Floor price. Applied even if (billed_km * price_per_km) is lower.",
     )
     osrm_maximum_price = fields.Monetary(
         string='Maximum Price',
@@ -98,8 +111,8 @@ class DeliveryCarrier(models.Model):
             carrier.company_currency_id = company.currency_id
 
     @api.depends('osrm_origin_lat', 'osrm_origin_lng',
-                 'osrm_price_per_km', 'osrm_minimum_price',
-                 'osrm_maximum_price')
+                 'osrm_price_per_km', 'osrm_round_up_km',
+                 'osrm_minimum_price', 'osrm_maximum_price')
     def _compute_osrm_last_info(self):
         """Diagnostic fields — populated at runtime by `_osrm_compute_price`.
         The compute here only initialises them; we use `sudo().write` in
@@ -219,7 +232,22 @@ class DeliveryCarrier(models.Model):
         distance_m = data['routes'][0].get('distance', 0)
         distance_km = distance_m / 1000.0
 
-        price = distance_km * self.osrm_price_per_km
+        # Determine the billable distance. When round_up_km is enabled,
+        # we round UP to the next integer km. So:
+        #   0.20 km -> 1 km  -> 1 * 1000 = 1000 -> max(1000, 2000) = 2000
+        #   1.00 km -> 1 km  -> 1 * 1000 = 1000 -> max(1000, 2000) = 2000
+        #   1.23 km -> 2 km  -> 2 * 1000 = 2000 -> max(2000, 2000) = 2000
+        #   1.80 km -> 2 km  -> 2 * 1000 = 2000 -> max(2000, 2000) = 2000
+        #   2.00 km -> 2 km  -> 2 * 1000 = 2000 -> max(2000, 2000) = 2000
+        #   2.01 km -> 3 km  -> 3 * 1000 = 3000 -> max(3000, 2000) = 3000
+        #   2.40 km -> 3 km  -> 3 * 1000 = 3000 -> max(3000, 2000) = 3000
+        #   3.50 km -> 4 km  -> 4 * 1000 = 4000 -> max(4000, 2000) = 4000
+        if self.osrm_round_up_km:
+            billed_km = math.ceil(distance_km) if distance_km > 0 else 0
+        else:
+            billed_km = distance_km
+
+        price = billed_km * self.osrm_price_per_km
         if self.osrm_minimum_price:
             price = max(price, self.osrm_minimum_price)
         if self.osrm_maximum_price:
@@ -232,25 +260,42 @@ class DeliveryCarrier(models.Model):
         })
 
         _logger.info(
-            "OSRM SO %s: distance=%.2f km, price=%s",
-            order.name, distance_km, price,
+            "OSRM SO %s: distance=%.3f km, billed=%.3f km, round_up=%s, price=%s",
+            order.name, distance_km, billed_km, self.osrm_round_up_km, price,
         )
         return price
 
     def _osrm_get_partner_coords(self, partner):
         """Return (lat, lng) for a partner, geocoding if needed.
 
-        Odoo ships `partner_latitude` / `partner_longitude` on
-        res.partner (added by base). They are populated by
-        `base_geolocalize` for the company address book, but for
-        guest checkout customers we lazily geocode via Nominatim
-        and cache the result on the partner.
+        Resolution order:
+        1. partner_latitude / partner_longitude (populated by base_geolocalize
+           or by a previous cached call).
+        2. Coordinates stored in partner.street2 in "lat,lng" format. The
+           website_sale_checkout_customizer module repurposes street2 as a
+           "Koordinat (Google Maps)" input, so customers type "-6.123,106.7"
+           directly. This avoids a brittle Nominatim round-trip.
+        3. Nominatim geocoding of the composed address as a last resort.
         """
-        # First check if partner already has coords (from base_geolocalize
-        # or from a previous OSRM/Nominatim call we cached).
+        # (1) Cached coordinates on the partner record.
         if partner.partner_latitude and partner.partner_longitude:
             return partner.partner_latitude, partner.partner_longitude
 
+        # (2) Coordinates embedded in street2 ("lat,lng" or "lat, lng").
+        lat, lng = self._parse_coords_from_street2(partner.street2 or '')
+        if lat is not None and lng is not None:
+            # Cache for next time so we don't re-parse on every checkout.
+            partner.sudo().write({
+                'partner_latitude': lat,
+                'partner_longitude': lng,
+            })
+            _logger.info(
+                "Parsed coords from street2 for partner %s -> lat=%s, lng=%s",
+                partner.display_name, lat, lng,
+            )
+            return lat, lng
+
+        # (3) Nominatim fallback (only if we have a real address).
         address = self._osrm_format_address(partner)
         if not address:
             return None, None
@@ -291,13 +336,58 @@ class DeliveryCarrier(models.Model):
         return None, None
 
     @staticmethod
+    def _parse_coords_from_street2(street2):
+        """Try to extract a "lat,lng" pair from the street2 field.
+
+        The website_sale_checkout_customizer module repurposes street2 as a
+        coordinate input. Accept common variants:
+            "-6.123456, 106.789012"
+            "-6.123456,106.789012"
+            "lat:-6.123 lng:106.789"
+        Returns (None, None) if the string does not look like coordinates.
+
+        We validate the ranges: lat in [-90, 90], lng in [-180, 180].
+        """
+        if not street2:
+            return None, None
+        text = street2.strip()
+        # Strip optional "lat:" / "lng:" prefixes that some users type.
+        text = re.sub(r'(?i)\b(lat|lng|lon)\s*[:=]\s*', '', text)
+        # Find two consecutive decimal numbers separated by , ; or whitespace.
+        m = re.search(
+            r'(-?\d{1,3}(?:\.\d+)?)\s*[,;\s]\s*(-?\d{1,3}(?:\.\d+)?)',
+            text,
+        )
+        if not m:
+            return None, None
+        try:
+            a = float(m.group(1))
+            b = float(m.group(2))
+        except (TypeError, ValueError):
+            return None, None
+        # Decide which is lat / which is lng by range. If both fit lat range,
+        # assume the user wrote "lat,lng" (the convention used by Google Maps).
+        candidates = []
+        if -90.0 <= a <= 90.0 and -180.0 <= b <= 180.0:
+            candidates.append((a, b))  # a=lat, b=lng
+        if -90.0 <= b <= 90.0 and -180.0 <= a <= 180.0:
+            candidates.append((b, a))  # b=lat, a=lng
+        if not candidates:
+            return None, None
+        # Prefer the first interpretation (lat,lng) — matches Google Maps.
+        return candidates[0]
+
+    @staticmethod
     def _osrm_format_address(partner):
-        """Compose a single-line address for geocoding."""
+        """Compose a single-line address for geocoding.
+
+        Skips street2 because the checkout customizer repurposes it as a
+        coordinate input; including "-6.123,106.7" in the Nominatim query
+        would only confuse the geocoder.
+        """
         parts = []
         if partner.street:
             parts.append(partner.street)
-        if partner.street2:
-            parts.append(partner.street2)
         if partner.city:
             parts.append(partner.city)
         if partner.state_id and partner.state_id.name:

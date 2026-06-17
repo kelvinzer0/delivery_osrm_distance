@@ -27,6 +27,7 @@
                     <group>
                         <group string="Pricing">
                             <field name="osrm_price_per_km"/>
+                            <field name="osrm_round_up_km"/>
                             <field name="osrm_minimum_price"/>
                             <field name="osrm_maximum_price"/>
                         </group>
