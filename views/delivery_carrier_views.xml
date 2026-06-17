@@ -1,37 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
     <!--
-        Extend the standard delivery.carrier form to show the OSRM
-        configuration group when delivery_type == 'osrm_distance'.
+        Extend the standard delivery.carrier form to add a dedicated
+        notebook page for OSRM Distance configuration, visible only
+        when delivery_type == 'osrm_distance'.
     -->
     <record id="view_delivery_carrier_form_osrm" model="ir.ui.view">
         <field name="name">delivery.carrier.form.osrm</field>
         <field name="model">delivery.carrier</field>
         <field name="inherit_id" ref="delivery.view_delivery_carrier_form"/>
         <field name="arch" type="xml">
-            <!-- Inject into the existing "Settings" notebook page. -->
-            <xpath expr="//page[@name='settings']" position="inside">
-                <group string="OSRM Distance Configuration"
-                       invisible="delivery_type != 'osrm_distance'">
-                    <group string="Routing Server">
-                        <field name="osrm_server_url"/>
-                        <field name="osrm_nominatim_url"/>
+            <!-- Append a new notebook page after the existing 'destination' page. -->
+            <xpath expr="//page[@name='destination']" position="after">
+                <page string="OSRM Distance" name="osrm_distance"
+                      invisible="delivery_type != 'osrm_distance'">
+                    <group>
+                        <group string="Routing Server">
+                            <field name="osrm_server_url"/>
+                            <field name="osrm_nominatim_url"/>
+                        </group>
+                        <group string="Dispatch Coordinates">
+                            <field name="osrm_origin_lat"/>
+                            <field name="osrm_origin_lng"/>
+                        </group>
                     </group>
-                    <group string="Dispatch Coordinates">
-                        <field name="osrm_origin_lat"/>
-                        <field name="osrm_origin_lng"/>
+                    <group>
+                        <group string="Pricing">
+                            <field name="osrm_price_per_km"/>
+                            <field name="osrm_minimum_price"/>
+                            <field name="osrm_maximum_price"/>
+                        </group>
+                        <group string="Last Call (diagnostic)">
+                            <field name="osrm_last_distance_km" readonly="1"/>
+                            <field name="osrm_last_price" readonly="1"/>
+                            <field name="company_currency_id" invisible="1"/>
+                        </group>
                     </group>
-                    <group string="Pricing">
-                        <field name="osrm_price_per_km"/>
-                        <field name="osrm_minimum_price"/>
-                        <field name="osrm_maximum_price"/>
-                    </group>
-                    <group string="Last Call (diagnostic)">
-                        <field name="osrm_last_distance_km" readonly="1"/>
-                        <field name="osrm_last_price" readonly="1"/>
-                        <field name="company_currency_id" invisible="1"/>
-                    </group>
-                </group>
+                </page>
             </xpath>
         </field>
     </record>
