@@ -81,17 +81,34 @@ class DeliveryCarrier(models.Model):
         help="Geocoding service used to convert customer addresses "
              "to latitude/longitude. For production, self-host Nominatim.",
     )
+    osrm_fallback_servers = fields.Text(
+        string='Fallback OSRM Servers',
+        default='https://routing.openstreetmap.de/routed-car',
+        help="One URL per line. Tried in order when the primary OSRM server "
+             "is unreachable or returns an SSL/HTTP error. "
+             "Known reliable public OSRM endpoints:\n"
+             "  - https://routing.openstreetmap.de/routed-car\n"
+             "  - https://routing.openstreetmap.de/routed-bike\n"
+             "  - https://routing.openstreetmap.de/routed-foot\n"
+             "Leave blank to disable fallback (only the primary is used).",
+    )
+    osrm_last_server_used = fields.Char(
+        string='Last Server Used (diagnostic)',
+        copy=False,
+        help="The base URL of the OSRM server that actually answered the "
+             "most recent pricing call. Useful for diagnosing failovers.",
+    )
     osrm_last_distance_km = fields.Float(
         string='Last Computed Distance (km)',
         digits=(16, 3),
-        compute='_compute_osrm_last_info',
+        copy=False,
         help="Distance returned by the most recent OSRM call made by "
              "this carrier (across all orders). For diagnostics only.",
     )
     osrm_last_price = fields.Monetary(
         string='Last Computed Price',
         currency_field='company_currency_id',
-        compute='_compute_osrm_last_info',
+        copy=False,
         help="Price returned by the most recent OSRM call made by "
              "this carrier. For diagnostics only.",
     )
@@ -109,18 +126,6 @@ class DeliveryCarrier(models.Model):
         for carrier in self:
             company = carrier.company_id or self.env.company
             carrier.company_currency_id = company.currency_id
-
-    @api.depends('osrm_origin_lat', 'osrm_origin_lng',
-                 'osrm_price_per_km', 'osrm_round_up_km',
-                 'osrm_minimum_price', 'osrm_maximum_price')
-    def _compute_osrm_last_info(self):
-        """Diagnostic fields — populated at runtime by `_osrm_compute_price`.
-        The compute here only initialises them; we use `sudo().write` in
-        the pricing method to override the computed value with real data.
-        """
-        for carrier in self:
-            carrier.osrm_last_distance_km = 0.0
-            carrier.osrm_last_price = 0.0
 
     # ==================================================================
     # Required Odoo hooks for a custom delivery_type.
@@ -194,6 +199,79 @@ class DeliveryCarrier(models.Model):
         return False
 
     # ==================================================================
+    # OSRM HTTP layer (with fallback server support)
+    # ==================================================================
+
+    def _osrm_call_route(self, origin_lng, origin_lat, dest_lng, dest_lat,
+                         order_name=None):
+        """Call OSRM /route/v1/driving/ with primary + fallback servers.
+
+        Tries `self.osrm_server_url` first, then each non-empty line of
+        `self.osrm_fallback_servers`. Returns `(data_dict, server_url)` on
+        the first server that returns `code == 'Ok'` with at least one
+        route. Raises `UserError` listing every attempted server + error
+        if all of them fail.
+
+        Typical failure modes we want to tolerate:
+          - SSL CERTIFICATE_VERIFY_FAILED (intermittent on public OSRM demo
+            server — known to serve a *.openstreetmap.de cert without the
+            right SAN for router.project-osrm.org)
+          - HTTP 429 Too Many Requests (rate-limit on public servers)
+          - HTTP 503 Service Unavailable (transient)
+          - socket timeout / DNS lookup failure
+          - JSON returned with `code != 'Ok'` (no route found)
+        """
+        self.ensure_one()
+        servers = [self.osrm_server_url.rstrip('/')]
+        for line in (self.osrm_fallback_servers or '').splitlines():
+            line = (line or '').strip()
+            if line and line not in servers:
+                servers.append(line.rstrip('/'))
+
+        path = (
+            f"/route/v1/driving/"
+            f"{origin_lng:.6f},{origin_lat:.6f};"
+            f"{dest_lng:.6f},{dest_lat:.6f}?overview=false"
+        )
+
+        errors = []
+        for base in servers:
+            url = base + path
+            try:
+                _logger.info(
+                    "OSRM request for SO %s via %s : %s",
+                    order_name or '-', base, url,
+                )
+                req = urllib.request.Request(url, headers={
+                    'User-Agent': _HTTP_USER_AGENT,
+                    'Accept': 'application/json',
+                })
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    raw = resp.read().decode('utf-8', 'replace')
+                data = json.loads(raw)
+            except Exception as exc:
+                _logger.warning(
+                    "OSRM call to %s failed for SO %s: %s",
+                    base, order_name or '-', exc,
+                )
+                errors.append(f"{base}: {exc}")
+                continue
+            if data.get('code') == 'Ok' and data.get('routes'):
+                return data, base
+            msg = data.get('message', '') or data.get('code', '?')
+            _logger.warning(
+                "OSRM call to %s returned no route for SO %s (code=%s)",
+                base, order_name or '-', data.get('code'),
+            )
+            errors.append(f"{base}: code={data.get('code')!r} msg={msg!r}")
+
+        raise UserError(_(
+            "Could not compute shipping: all OSRM servers failed.\n"
+            "Attempted servers:\n%s",
+            '\n'.join(f'  - {e}' for e in errors),
+        ))
+
+    # ==================================================================
     # Pricing implementation
     # ==================================================================
 
@@ -212,22 +290,15 @@ class DeliveryCarrier(models.Model):
                 partner.display_name,
             ))
 
-        # OSRM expects LON,LAT;LON,LAT
-        url = (
-            f"{self.osrm_server_url.rstrip('/')}/route/v1/driving/"
-            f"{self.osrm_origin_lng:.6f},{self.osrm_origin_lat:.6f};"
-            f"{dest_lng:.6f},{dest_lat:.6f}?overview=false"
+        # OSRM expects LON,LAT;LON,LAT. v1.0.3: try primary server first,
+        # then each fallback server in order. Returns the first valid JSON
+        # response. Solves the intermittent SSL hostname-mismatch errors on
+        # router.project-osrm.org (the public OSRM demo server often serves
+        # a *.openstreetmap.de cert without a SAN for project-osrm.org).
+        data, server_used = self._osrm_call_route(
+            self.osrm_origin_lng, self.osrm_origin_lat, dest_lng, dest_lat,
+            order_name=order.name,
         )
-        _logger.info("OSRM request for SO %s: %s", order.name, url)
-        req = urllib.request.Request(url, headers={'User-Agent': _HTTP_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-
-        if data.get('code') != 'Ok' or not data.get('routes'):
-            raise UserError(_(
-                "OSRM did not return a route. Code: %s, message: %s",
-                data.get('code'), data.get('message', ''),
-            ))
 
         distance_m = data['routes'][0].get('distance', 0)
         distance_km = distance_m / 1000.0
@@ -253,15 +324,24 @@ class DeliveryCarrier(models.Model):
         if self.osrm_maximum_price:
             price = min(price, self.osrm_maximum_price)
 
-        # Cache on the SO for transparency.
+        # Cache on the SO for transparency. v1.0.3: also persist which OSRM
+        # server actually answered so the admin can see failovers in the
+        # diagnostic panel.
+        self.sudo().write({
+            'osrm_last_distance_km': distance_km,
+            'osrm_last_price': price,
+            'osrm_last_server_used': server_used,
+        })
         order.sudo().write({
             'osrm_last_distance_km': distance_km,
             'osrm_last_price': price,
         })
 
         _logger.info(
-            "OSRM SO %s: distance=%.3f km, billed=%.3f km, round_up=%s, price=%s",
-            order.name, distance_km, billed_km, self.osrm_round_up_km, price,
+            "OSRM SO %s: server=%s distance=%.3f km, billed=%.3f km, "
+            "round_up=%s, price=%s",
+            order.name, server_used, distance_km, billed_km,
+            self.osrm_round_up_km, price,
         )
         return price
 

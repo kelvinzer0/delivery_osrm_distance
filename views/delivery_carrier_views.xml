@@ -17,6 +17,7 @@
                     <group>
                         <group string="Routing Server">
                             <field name="osrm_server_url"/>
+                            <field name="osrm_fallback_servers" widget="text"/>
                             <field name="osrm_nominatim_url"/>
                         </group>
                         <group string="Dispatch Coordinates">
@@ -32,6 +33,7 @@
                             <field name="osrm_maximum_price"/>
                         </group>
                         <group string="Last Call (diagnostic)">
+                            <field name="osrm_last_server_used" readonly="1"/>
                             <field name="osrm_last_distance_km" readonly="1"/>
                             <field name="osrm_last_price" readonly="1"/>
                             <field name="company_currency_id" invisible="1"/>
